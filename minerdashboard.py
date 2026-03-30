@@ -134,19 +134,24 @@ def probe_cgminer(ip, port=4028, timeout=1.5):
 
 
 def probe_http_api(ip, timeout=1.5):
-    """Probe HTTP API (NerdAxe, Bitaxe, Lucky Miner, Gamma, Antminer, etc). Returns info dict or None."""
-    ports = [80, 8080]
-    paths = ["/api/system/info", "/api/system"]
-    for port in ports:
-        for path in paths:
-            try:
-                r = requests.get(f"http://{ip}:{port}{path}", timeout=timeout)
-                if r.status_code == 200:
-                    data = r.json()
-                    if any(k in data for k in ['hashRate', 'sharesAccepted', 'version', 'hostname']):
-                        return {"api": "http", "data": data}
-            except Exception:
-                pass
+    """Probe HTTP API miners. Tries Goldshell, NerdAxe/Bitaxe, Lucky, Gamma endpoints."""
+    checks = [
+        # (port, path, required_keys)
+        (80,   "/api/v1/info",      ["model", "fwVersion"]),           # Goldshell
+        (80,   "/api/system/info",  ["hashRate", "hostname"]),          # NerdAxe/Bitaxe
+        (8080, "/api/system/info",  ["hashRate", "hostname"]),
+        (80,   "/api/system",       ["hashRate", "hostname"]),
+        (80,   "/api/v1/status",    ["model"]),                         # some Goldshell variants
+    ]
+    for port, path, keys in checks:
+        try:
+            r = requests.get(f"http://{ip}:{port}{path}", timeout=timeout)
+            if r.status_code == 200:
+                data = r.json()
+                if any(k in data for k in keys):
+                    return {"api": "http", "data": data, "path": path}
+        except Exception:
+            pass
     return None
 
 
@@ -182,7 +187,14 @@ def detect_miner_type(ip, result):
 
     elif result["api"] == "http":
         data = result["data"]
-        # Pull the most descriptive name available from the device
+        path = result.get("path", "")
+
+        # Goldshell: identified by fwVersion + model keys (their /api/v1/ endpoints)
+        if "fwVersion" in data and "model" in data:
+            model = str(data.get("model", "")).strip()
+            return "goldshell", model or f"Goldshell-{last}"
+
+        # Pull best available name for other HTTP devices
         device_name = (
             data.get("hostname")
             or data.get("model")
@@ -202,12 +214,12 @@ def detect_miner_type(ip, result):
             return "antminer", device_name or f"Antminer-{last}"
         if "lucky" in combined:
             return "lucky", device_name or f"Lucky-{last}"
-        if "nerd" in combined:
-            return "nerd", device_name or f"NerdAxe-{last}"
         if "gamma" in combined:
             return "nerd", device_name or f"Gamma-{last}"
         if "bitaxe" in combined:
             return "nerd", device_name or f"Bitaxe-{last}"
+        if "nerd" in combined:
+            return "nerd", device_name or f"NerdAxe-{last}"
         return "nerd", device_name or f"Miner-{last}"
 
     return "unknown", f"Miner-{last}"
@@ -548,7 +560,75 @@ class UniversalMonitor:
                         "ping": f"{float(parsed_estats.get('PING', 0)):.1f}ms",
                         "u": p.get('User', 'N/A')
                     }
+            elif miner['type_hint'] == "antminer":
+                # Antminer S9/S17/S19 — cgminer API on port 4028, same protocol as Avalon
+                sum_d = self._avalon_cmd(ip, "summary")
+                pool_d = self._avalon_cmd(ip, "pools")
+                if sum_d and pool_d:
+                    s = sum_d.get('SUMMARY', [{}])[0]
+                    p = pool_d.get('POOLS', [{}])[0]
+                    h_th = (s.get('GHS 5s') or s.get('MHS 5s', 0) / 1000) / 1000
+                    acc = int(s.get('Accepted', 0))
+                    rej = int(s.get('Rejected', 0))
+                    blocks = int(s.get('Found Blocks', 0))
+                    temp = s.get('Temperature', s.get('temp', 0))
+                    self._update_activity_logs(miner['name'], ip, acc, rej, blocks, now_ts)
+                    return {
+                        "online": True, "hash": h_th,
+                        "ver": s.get('Description', 'Antminer'),
+                        "eff": "--",
+                        "temp": f"{temp}°C",
+                        "pwr": "--",
+                        "vf": "--",
+                        "fan": "--",
+                        "up": self._format_uptime(s.get('Elapsed', 0)),
+                        "bd": self._format_diff(s.get('Best Share', 0)),
+                        "sd": "--",
+                        "sh": f"{acc}/{rej}",
+                        "pd": f"{int(float(p.get('Diff', 0))):,}" if p.get('Diff') else "--",
+                        "bl": blocks,
+                        "p": p.get('URL', 'Unknown'),
+                        "ping": "--",
+                        "u": p.get('User', 'N/A')
+                    }
+
+            elif miner['type_hint'] == "goldshell":
+                # Goldshell (Mini Doge 2/3, HS Box, etc.) — HTTP /api/v1/ REST API
+                info = requests.get(f"http://{ip}/api/v1/info", timeout=3.0).json()
+                sum_r = requests.get(f"http://{ip}/api/v1/cgminer?cgminer=summary", timeout=3.0).json()
+                pool_r = requests.get(f"http://{ip}/api/v1/cgminer?cgminer=pools", timeout=3.0).json()
+                s = sum_r.get('SUMMARY', [{}])[0]
+                p = pool_r.get('POOLS', [{}])[0]
+                h_th = (s.get('GHS 5s') or s.get('MHS 5s', 0) / 1000) / 1000
+                acc = int(s.get('Accepted', 0))
+                rej = int(s.get('Rejected', 0))
+                blocks = int(s.get('Found Blocks', 0))
+                self._update_activity_logs(miner['name'], ip, acc, rej, blocks, now_ts)
+                fans_raw = info.get('fans', [])
+                fan_str = " / ".join(str(f.get('rpm', '--')) for f in fans_raw) + " RPM" if fans_raw else "--"
+                temps_raw = info.get('temps', [])
+                temp_str = " / ".join(str(t.get('temp', '--')) for t in temps_raw) + "°C" if temps_raw else f"{s.get('Temperature', 0)}°C"
+                return {
+                    "online": True, "hash": h_th,
+                    "ver": info.get('fwVersion', 'N/A'),
+                    "eff": "--",
+                    "temp": temp_str,
+                    "pwr": f"{info.get('power', '--')}W" if info.get('power') else "--",
+                    "vf": "--",
+                    "fan": fan_str,
+                    "up": self._format_uptime(s.get('Elapsed', 0)),
+                    "bd": self._format_diff(s.get('Best Share', 0)),
+                    "sd": "--",
+                    "sh": f"{acc}/{rej}",
+                    "pd": f"{int(float(p.get('Diff', 0))):,}" if p.get('Diff') else "--",
+                    "bl": blocks,
+                    "p": p.get('URL', 'Unknown'),
+                    "ping": "--",
+                    "u": p.get('User', 'N/A')
+                }
+
             else:
+                # NerdAxe / Bitaxe / Lucky / Gamma — HTTP /api/system/info
                 r = requests.get(f"http://{ip}/api/system/info", timeout=3.0).json()
                 st = r.get('stratum', {})
                 h_th = r.get('hashRate', 0) / 1000
@@ -561,24 +641,10 @@ class UniversalMonitor:
                 self._update_activity_logs(miner['name'], ip, acc, rej, blocks, now_ts)
 
                 ping = 0
-                keys_to_check = ['responseTime', 'pingRtt', 'latency']
-                pools = st.get('pools', [])
-                if pools and isinstance(pools, list):
-                    p0 = pools[0]
-                    for k in keys_to_check:
-                        if k in p0:
-                            ping = p0[k]
-                            break
-                if ping == 0:
-                    for k in keys_to_check:
-                        if k in st:
-                            ping = st[k]
-                            break
-                if ping == 0:
-                    for k in keys_to_check:
-                        if k in r:
-                            ping = r[k]
-                            break
+                for k in ['responseTime', 'pingRtt', 'latency']:
+                    ping = (st.get('pools', [{}])[0].get(k) or st.get(k) or r.get(k) or 0)
+                    if ping:
+                        break
 
                 return {
                     "online": True, "hash": h_th, "ver": r.get('version', 'N/A'),
@@ -733,7 +799,7 @@ Examples:
     parser.add_argument('--add', type=str, metavar='IP', help='Add a miner by IP')
     parser.add_argument('--name', type=str, help='Name for --add')
     parser.add_argument('--type', type=str, default='auto',
-                        choices=['auto', 'avalon', 'nerd', 'lucky', 'antminer'],
+                        choices=['auto', 'avalon', 'antminer', 'goldshell', 'nerd', 'lucky'],
                         help='Miner type for --add (default: auto-detect)')
     parser.add_argument('--remove', type=str, metavar='IP_OR_NAME', help='Remove a miner')
     parser.add_argument('--rename', type=str, metavar='IP_OR_NAME', help='Rename a miner')
@@ -825,7 +891,7 @@ Examples:
                     detected_type, detected_name = "avalon", f"Miner-{last}"
                     console.print(" [yellow]no response, using defaults[/]")
                 name = Prompt.ask("  Name", default=detected_name)
-                type_hint = Prompt.ask("  Type", choices=["avalon", "nerd", "lucky", "antminer"], default=detected_type)
+                type_hint = Prompt.ask("  Type", choices=["avalon", "antminer", "goldshell", "nerd", "lucky"], default=detected_type)
                 existing = load_config()
                 if not any(m['ip'] == ip for m in existing):
                     existing.append({"ip": ip, "name": name, "type_hint": type_hint})
@@ -881,13 +947,13 @@ Examples:
         elif cmd == 'f':
             console.print("\n[bold cyan]Fan Speed Control[/]  [dim](Ctrl+C to cancel)[/]")
             existing = load_config()
-            avalon_miners = [m for m in existing if m['type_hint'] == 'avalon']
-            if not avalon_miners:
-                console.print("[yellow]No Avalon/cgminer miners in config (fan control uses cgminer API)[/]")
+            fan_miners = [m for m in existing if m['type_hint'] in ('avalon', 'antminer', 'goldshell')]
+            if not fan_miners:
+                console.print("[yellow]No supported miners for fan control (avalon/antminer/goldshell)[/]")
                 time.sleep(1)
                 mon = UniversalMonitor(load_config())
                 continue
-            console.print("  Miners: " + "  ".join(f"[cyan]{m['name']}[/] ({m['ip']})" for m in avalon_miners))
+            console.print("  Miners: " + "  ".join(f"[cyan]{m['name']}[/] ({m['ip']})" for m in fan_miners))
             try:
                 target = Prompt.ask("  IP or name (or 'all')")
                 speed = Prompt.ask("  Fan speed % (0-100)", default="60")
@@ -898,17 +964,28 @@ Examples:
                     time.sleep(1)
                     mon = UniversalMonitor(load_config())
                     continue
-                targets = avalon_miners if target.lower() == 'all' else [
-                    m for m in avalon_miners if m['ip'] == target or m['name'] == target
+                targets = fan_miners if target.lower() == 'all' else [
+                    m for m in fan_miners if m['ip'] == target or m['name'] == target
                 ]
                 if not targets:
                     console.print(f"[yellow]Not found: {target}[/]")
                 else:
                     for m in targets:
-                        r = _cgminer_cmd(m['ip'], "ascset", parameter=f"0,fan,{speed_val}", timeout=3.0)
-                        status = r.get("STATUS", [{}])[0].get("STATUS", "?") if r else "no response"
-                        icon = "[green]✓[/]" if status == "S" else "[yellow]~[/]"
-                        console.print(f"  {icon} {m['name']} ({m['ip']}) → fan {speed_val}%  ({status})")
+                        if m['type_hint'] == 'goldshell':
+                            try:
+                                r = requests.post(f"http://{m['ip']}/api/v1/fans",
+                                                  json={"fans": [{"id": 0, "rpm": speed_val * 60}]},
+                                                  timeout=3.0)
+                                ok = r.status_code == 200
+                            except Exception:
+                                ok = False
+                            icon = "[green]✓[/]" if ok else "[yellow]~[/]"
+                            console.print(f"  {icon} {m['name']} ({m['ip']}) → fan {speed_val}%")
+                        else:
+                            r = _cgminer_cmd(m['ip'], "ascset", parameter=f"0,fan,{speed_val}", timeout=3.0)
+                            status = r.get("STATUS", [{}])[0].get("STATUS", "?") if r else "no response"
+                            icon = "[green]✓[/]" if status == "S" else "[yellow]~[/]"
+                            console.print(f"  {icon} {m['name']} ({m['ip']}) → fan {speed_val}%  ({status})")
             except KeyboardInterrupt:
                 console.print("\n[dim]Cancelled.[/]")
             time.sleep(1)
