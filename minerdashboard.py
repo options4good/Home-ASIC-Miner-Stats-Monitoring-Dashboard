@@ -160,29 +160,43 @@ def detect_miner_type(ip, result):
     last = ip.split('.')[-1]
 
     if result["api"] == "cgminer":
-        # Query version command — Avalon returns e.g. "Type": "Avalon Q" or "Avalon1246 aa-..."
-        type_str = ""
         ver_data = _cgminer_cmd(ip, "version", timeout=2.0)
+        type_str = ""
+        cgminer_impl = ""
         if ver_data:
             ver_info = ver_data.get("VERSION", [{}])[0]
-            # Prefer Type, then Miner (firmware string), then Description
-            type_str = (
-                ver_info.get("Type")
-                or ver_info.get("Description")
-                or ver_info.get("Miner")
-                or ""
-            ).strip()
+            # CGMiner field reveals the internal implementation (e.g. "intminer" = Goldshell)
+            cgminer_impl = str(ver_info.get("CGMiner", "")).lower()
+            # Type is the device model; avoid Miner which is firmware version
+            type_str = (ver_info.get("Type") or ver_info.get("Description") or "").strip()
+
         if not type_str:
-            # Fallback: Description in summary
             type_str = result["data"].get("SUMMARY", [{}])[0].get("Description", "").strip()
 
         type_lower = type_str.lower()
+
+        # Goldshell uses "intminer" as their internal cgminer fork name
+        if "intminer" in cgminer_impl:
+            # Cross-probe HTTP API for real model name (e.g. "HS BOX", "Mini DOGE Pro")
+            http = probe_http_api(ip)
+            if http and "fwVersion" in http["data"] and "model" in http["data"]:
+                model = http["data"].get("model", "").strip()
+                return "goldshell", model or f"Goldshell-{last}"
+            return "goldshell", f"Goldshell-{last}"
+
         if "antminer" in type_lower or "bmminer" in type_lower:
-            return "antminer", type_str or f"Antminer-{last}"
-        if "avalon" in type_lower or type_str:
-            # Use whatever the device reported; fallback to IP hint
-            return "avalon", type_str or f"Avalon-{last}"
-        # Nothing came back from the API — use IP hint
+            return "antminer", type_str if type_str else f"Antminer-{last}"
+
+        if "avalon" in type_lower:
+            # Strip trailing firmware date stamps (e.g. "Avalon1246 aa-20220928" → "Avalon1246")
+            name = re.sub(r'\s+[a-z]{2}-\d{8}.*', '', type_str).strip()
+            return "avalon", name or f"Avalon-{last}"
+
+        # type_str exists but isn't a recognised brand — only use it if it looks like a model name
+        # (reject strings with version numbers or "unknown")
+        if type_str and "unknown" not in type_lower and not re.search(r'\d+\.\d+', type_str):
+            return "avalon", type_str
+
         return "avalon", f"Miner-{last}"
 
     elif result["api"] == "http":
