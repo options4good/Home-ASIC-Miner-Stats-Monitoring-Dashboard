@@ -15,6 +15,10 @@ import argparse
 import ipaddress
 import os
 import sys
+import tty
+import termios
+import select
+import queue as _queue
 from collections import deque
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -156,12 +160,15 @@ def detect_miner_type(ip, result):
             # Fallback to summary Description
             type_str = result["data"].get("SUMMARY", [{}])[0].get("Description", "")
         type_lower = type_str.lower()
+        last = ip.split('.')[-1]
         if "avalon" in type_lower:
-            return "avalon", type_str if type_str else "Avalon"
+            name = type_str.split()[0] if type_str else f"Avalon-{last}"
+            return "avalon", name
         if "antminer" in type_lower or "bmminer" in type_lower:
-            return "antminer", type_str if type_str else "Antminer"
+            name = type_str.split()[0] if type_str else f"Antminer-{last}"
+            return "antminer", name
         # Default: Avalon (most common cgminer device on port 4028)
-        return "avalon", "Avalon"
+        return "avalon", f"Avalon-{last}"
     elif result["api"] == "http":
         data = result["data"]
         hostname = str(data.get("hostname", "")).lower()
@@ -170,18 +177,19 @@ def detect_miner_type(ip, result):
         version = str(data.get("version", "")).lower()
         combined = f"{hostname} {board} {model} {version}"
 
+        last = ip.split('.')[-1]
         if "nerd" in combined:
-            return "nerd", data.get("hostname", "NerdAxe")
+            return "nerd", data.get("hostname") or f"NerdAxe-{last}"
         elif "gamma" in combined:
-            return "nerd", data.get("hostname", "Gamma")
+            return "nerd", data.get("hostname") or f"Gamma-{last}"
         elif "lucky" in combined:
-            return "lucky", data.get("hostname", "Lucky")
+            return "lucky", data.get("hostname") or f"Lucky-{last}"
         elif "bitaxe" in combined:
-            return "nerd", data.get("hostname", "Bitaxe")
+            return "nerd", data.get("hostname") or f"Bitaxe-{last}"
         elif "antminer" in combined:
-            return "antminer", data.get("hostname", "Antminer")
+            return "antminer", data.get("hostname") or f"Antminer-{last}"
         else:
-            return "nerd", data.get("hostname", "HTTP-Miner")
+            return "nerd", data.get("hostname") or f"Miner-{last}"
     return "unknown", "Unknown"
 
 
@@ -245,78 +253,27 @@ def scan_network(subnet=None, max_workers=100):
 
 
 # =============================================================================
-# Setup Wizard
+# Auto Setup (zero-interaction first run)
 # =============================================================================
 
-def interactive_setup():
-    """Interactive first-run setup wizard."""
-    console.print(Panel(
-        "[bold cyan]ASIC Miner Dashboard - First Run Setup[/]\n\n"
-        "No miners.json config found.\n"
-        "Let's set up your miners.",
-        border_style="bright_cyan"
-    ))
-
-    choice = Prompt.ask(
-        "\nHow do you want to add miners?",
-        choices=["scan", "manual"],
-        default="scan"
-    )
-
-    miners = []
-
-    if choice == "scan":
+def auto_setup(subnet=None):
+    """Zero-interaction first run: scan LAN, add ALL found miners, launch dashboard."""
+    console.print("[bold cyan]First run — scanning your LAN for miners...[/]")
+    if subnet is None:
         subnet, local_ip = get_local_subnet()
-        if subnet:
-            console.print(f"[dim]Detected local IP {local_ip} → scanning {subnet}[/]")
-        else:
-            subnet = Prompt.ask("Could not detect subnet. Enter manually (e.g. 192.168.0.0/24)")
-
-        discovered = scan_network(subnet)
-
-        if discovered:
-            console.print("\n[bold]Discovered miners:[/]")
-            for i, m in enumerate(discovered, 1):
-                console.print(f"  {i}. [cyan]{m['ip']}[/] - {m['name']} ({m['type_hint']}, {m['api']})")
-
-            keep_all = Confirm.ask("\nAdd all discovered miners to config?", default=True)
-            if keep_all:
-                for m in discovered:
-                    miners.append({
-                        "ip": m["ip"],
-                        "name": m["name"],
-                        "type_hint": m["type_hint"]
-                    })
-            else:
-                for m in discovered:
-                    if Confirm.ask(f"  Add {m['ip']} ({m['name']})?", default=True):
-                        name = Prompt.ask(f"    Name for {m['ip']}", default=m["name"])
-                        miners.append({
-                            "ip": m["ip"],
-                            "name": name,
-                            "type_hint": m["type_hint"]
-                        })
-        else:
-            console.print("[yellow]No miners found. You can add them manually.[/]")
-
-    # Offer manual add — only default to Yes if nothing configured yet
-    need_manual = len(miners) == 0
-    while True:
-        add_more = Confirm.ask("\nAdd a miner manually?", default=need_manual)
-        if not add_more:
-            break
-        need_manual = False  # after first entry, default to No
-        ip = Prompt.ask("  Miner IP address")
-        name = Prompt.ask("  Miner name", default=f"Miner-{len(miners)+1}")
-        type_hint = Prompt.ask("  Type", choices=["avalon", "nerd", "lucky", "antminer"], default="avalon")
-        miners.append({"ip": ip, "name": name, "type_hint": type_hint})
-
-    if miners:
-        save_config(miners)
-        console.print(f"\n[green]Setup complete! {len(miners)} miner(s) configured.[/]")
-    else:
-        console.print("[yellow]No miners configured. Run with --scan or --add to add miners later.[/]")
-
+        if subnet is None:
+            console.print("[red]Could not detect subnet. Add miners manually: ./run.sh --add IP --name NAME[/]")
+            return []
+        console.print(f"[dim]Local IP: {local_ip}  |  Subnet: {subnet}[/]")
+    discovered = scan_network(subnet)
+    if not discovered:
+        console.print("[yellow]No miners found on {subnet}.[/]")
+        console.print("[dim]Add manually: ./run.sh --add IP --name NAME  |  or re-run: ./run.sh --setup[/]")
+        return []
+    miners = [{"ip": m["ip"], "name": m["name"], "type_hint": m["type_hint"]} for m in discovered]
+    save_config(miners)
+    console.print(f"[green]Added {len(miners)} miner(s) — launching dashboard...[/]")
+    time.sleep(0.8)
     return miners
 
 
@@ -325,33 +282,23 @@ def interactive_setup():
 # =============================================================================
 
 def cmd_scan(args):
-    """Scan network and optionally add to config."""
+    """Scan network and add all new miners to config."""
     subnet = getattr(args, 'subnet', None)
     discovered = scan_network(subnet)
-
     if not discovered:
         return
-
-    console.print("\n[bold]Discovered miners:[/]")
-    for i, m in enumerate(discovered, 1):
-        console.print(f"  {i}. [cyan]{m['ip']}[/] - {m['name']} ({m['type_hint']}, {m['api']})")
-
-    if Confirm.ask("\nAdd discovered miners to config?", default=True):
-        existing = load_config()
-        existing_ips = {m['ip'] for m in existing}
-        added = 0
-        for m in discovered:
-            if m['ip'] not in existing_ips:
-                existing.append({
-                    "ip": m["ip"],
-                    "name": m["name"],
-                    "type_hint": m["type_hint"]
-                })
-                added += 1
-            else:
-                console.print(f"  [dim]Skipped {m['ip']} (already in config)[/]")
-        save_config(existing)
-        console.print(f"[green]Added {added} new miner(s).[/]")
+    existing = load_config()
+    existing_ips = {m['ip'] for m in existing}
+    added = 0
+    for m in discovered:
+        if m['ip'] not in existing_ips:
+            existing.append({"ip": m["ip"], "name": m["name"], "type_hint": m["type_hint"]})
+            console.print(f"  [green]+[/] {m['ip']}  {m['name']}  ({m['type_hint']})")
+            added += 1
+        else:
+            console.print(f"  [dim]=[/] {m['ip']}  already in config")
+    save_config(existing)
+    console.print(f"[green]Done — added {added} new miner(s).[/]")
 
 
 def cmd_add(args):
@@ -433,9 +380,39 @@ def cmd_list(_args):
     console.print(table)
 
 
-def cmd_setup(_args):
-    """Run interactive setup wizard."""
-    interactive_setup()
+def cmd_setup(args):
+    """Re-scan LAN and reset config."""
+    subnet = getattr(args, 'subnet', None)
+    auto_setup(subnet)
+
+
+# =============================================================================
+# Keyboard Input
+# =============================================================================
+
+_cmd_queue: _queue.Queue = _queue.Queue()
+
+
+def _keyboard_reader() -> None:
+    """Background thread: capture single keypresses and push to _cmd_queue."""
+    if not sys.stdin.isatty():
+        return
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)          # single-char reads, Ctrl+C still works
+        while True:
+            if select.select([sys.stdin], [], [], 0.05)[0]:
+                ch = sys.stdin.read(1)
+                if ch in ('q', 'Q', 'a', 'A', 'r', 'R', 'd', 'D', 's', 'S', '\x03'):
+                    _cmd_queue.put(ch.lower())
+    except Exception:
+        pass
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except Exception:
+            pass
 
 
 # =============================================================================
@@ -681,6 +658,15 @@ class UniversalMonitor:
             Text.from_markup(f"[bold cyan]Version: {APP_VERSION}[/]")
         )
 
+        controls = (
+            "[bold dim]── Controls ──[/]\n"
+            "[bold cyan][a][/] add miner\n"
+            "[bold cyan][r][/] rename\n"
+            "[bold cyan][d][/] delete\n"
+            "[bold cyan][s][/] rescan LAN\n"
+            "[bold cyan][q][/] quit"
+        )
+
         layout = Layout()
         layout.split_row(
             Layout(name="left", ratio=4),
@@ -692,8 +678,9 @@ class UniversalMonitor:
             Layout(Panel(luck_t, title="[bold]Mining[/]", border_style="bold bright_red"), ratio=1),
             Layout(Panel(pool_t, title="[bold]Connectivity[/]", border_style="bright_cyan"), ratio=1),
         )
-        layout["right"].update(
-            Panel("\n".join(self.share_logs), title="[bold]Activity[/]", border_style="bold bright_yellow")
+        layout["right"].split_column(
+            Layout(Panel("\n".join(self.share_logs), title="[bold]Activity[/]", border_style="bold bright_yellow"), ratio=4),
+            Layout(Panel(controls, border_style="dim"), size=10),
         )
         return layout
 
@@ -768,20 +755,105 @@ Examples:
     miners = load_config()
 
     if not miners:
-        # First run - launch setup wizard
-        miners = interactive_setup()
+        miners = auto_setup()
         if not miners:
-            console.print("[red]No miners configured. Exiting.[/]")
+            console.print("[red]No miners found. Add one: ./run.sh --add IP --name NAME[/]")
             sys.exit(1)
 
     console.print(f"[cyan]Starting dashboard with {len(miners)} miner(s)...[/]")
-    time.sleep(1)
+    time.sleep(0.5)
+
+    # Start keyboard reader thread
+    kb = threading.Thread(target=_keyboard_reader, daemon=True)
+    kb.start()
 
     mon = UniversalMonitor(miners)
-    with Live(mon.update_ui(), screen=True, refresh_per_second=4) as live:
-        while True:
-            live.update(mon.update_ui())
-            time.sleep(0.25)
+
+    while True:
+        cmd = None
+
+        # Run live dashboard until a key is pressed
+        with Live(mon.update_ui(), screen=True, refresh_per_second=4) as live:
+            while True:
+                try:
+                    cmd = _cmd_queue.get_nowait()
+                    break
+                except _queue.Empty:
+                    pass
+                live.update(mon.update_ui())
+                time.sleep(0.25)
+
+        # Handle command outside Live context (terminal is restored here)
+        if cmd in ('q', '\x03'):
+            break
+
+        elif cmd == 'a':
+            console.print("\n[bold cyan]Add Miner[/]")
+            ip = Prompt.ask("  IP address")
+            last = ip.split('.')[-1]
+            name = Prompt.ask("  Name", default=f"Miner-{last}")
+            type_hint = Prompt.ask("  Type", choices=["avalon", "nerd", "lucky", "antminer"], default="avalon")
+            existing = load_config()
+            if not any(m['ip'] == ip for m in existing):
+                existing.append({"ip": ip, "name": name, "type_hint": type_hint})
+                save_config(existing)
+                console.print(f"[green]Added {name} ({ip})[/]")
+            else:
+                console.print(f"[yellow]{ip} already in config[/]")
+            time.sleep(0.5)
+            mon = UniversalMonitor(load_config())
+
+        elif cmd == 'r':
+            console.print("\n[bold cyan]Rename Miner[/]")
+            target = Prompt.ask("  IP or current name")
+            existing = load_config()
+            match = next((m for m in existing if m['ip'] == target or m['name'] == target), None)
+            if match:
+                new_name = Prompt.ask("  New name", default=match['name'])
+                match['name'] = new_name
+                save_config(existing)
+                console.print(f"[green]Renamed to {new_name}[/]")
+            else:
+                console.print(f"[yellow]Not found: {target}[/]")
+            time.sleep(0.5)
+            mon = UniversalMonitor(load_config())
+
+        elif cmd == 'd':
+            console.print("\n[bold cyan]Delete Miner[/]")
+            target = Prompt.ask("  IP or name")
+            existing = load_config()
+            before = len(existing)
+            existing = [m for m in existing if m['ip'] != target and m['name'] != target]
+            if len(existing) < before:
+                save_config(existing)
+                console.print(f"[green]Removed {target}[/]")
+                if not existing:
+                    console.print("[yellow]No miners left in config.[/]")
+                    break
+            else:
+                console.print(f"[yellow]Not found: {target}[/]")
+            time.sleep(0.5)
+            mon = UniversalMonitor(load_config())
+
+        elif cmd == 's':
+            console.print("\n[bold cyan]Rescanning LAN...[/]")
+            subnet, _ = get_local_subnet()
+            discovered = scan_network(subnet)
+            if discovered:
+                existing = load_config()
+                existing_ips = {m['ip'] for m in existing}
+                added = 0
+                for d in discovered:
+                    if d['ip'] not in existing_ips:
+                        existing.append({"ip": d['ip'], "name": d['name'], "type_hint": d['type_hint']})
+                        console.print(f"  [green]+[/] {d['ip']}  {d['name']}")
+                        added += 1
+                save_config(existing)
+                console.print(f"[green]{added} new miner(s) added.[/]" if added else "[dim]No new miners found.[/]")
+            else:
+                console.print("[yellow]No miners found.[/]")
+            time.sleep(1)
+            mon = UniversalMonitor(load_config())
 
 
 if __name__ == "__main__":
