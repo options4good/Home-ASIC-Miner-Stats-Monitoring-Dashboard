@@ -44,9 +44,12 @@ except ImportError:
     print("Install with: pip install requests")
     sys.exit(1)
 
-APP_VERSION = "V3.1.0"
+APP_VERSION = "V3.2.0"
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "miners.json")
 console = Console()
+
+# Cached authenticated HTTP sessions keyed by IP
+_sessions: dict = {}
 
 
 # =============================================================================
@@ -433,6 +436,57 @@ def cmd_setup(args):
 
 
 # =============================================================================
+# HTTP Session Manager (auto-auth)
+# =============================================================================
+
+# Credentials tried in order for each device type
+_CREDS = {
+    "goldshell": [("admin", "123456789"), ("admin", "admin")],
+    "default":   [("root", "root"), ("admin", "admin"), ("admin", "123456789")],
+}
+
+
+def _make_session(ip: str, type_hint: str) -> requests.Session:
+    """Return a cached, authenticated requests.Session for an HTTP miner.
+
+    Goldshell: POSTs to /api/v1/user/login and stores the JWT bearer token.
+    Others: falls back to HTTP Basic Auth.
+    """
+    if ip in _sessions:
+        return _sessions[ip]
+
+    s = requests.Session()
+    creds = _CREDS.get(type_hint, _CREDS["default"])
+
+    if type_hint == "goldshell":
+        for user, pwd in creds:
+            try:
+                r = s.post(f"http://{ip}/api/v1/user/login",
+                           json={"username": user, "password": pwd}, timeout=3.0)
+                if r.status_code == 200:
+                    token = r.json().get("token") or r.json().get("jwt", "")
+                    if token:
+                        s.headers["Authorization"] = f"Bearer {token}"
+                    break   # login accepted (even if no token — cookie may be set)
+            except Exception:
+                pass
+    else:
+        # Try Basic Auth — use first pair that returns 200 on a quick probe
+        for user, pwd in creds:
+            try:
+                r = requests.get(f"http://{ip}/api/system/info",
+                                 auth=(user, pwd), timeout=2.0)
+                if r.status_code == 200:
+                    s.auth = (user, pwd)
+                    break
+            except Exception:
+                pass
+
+    _sessions[ip] = s
+    return s
+
+
+# =============================================================================
 # Keyboard Input
 # =============================================================================
 
@@ -608,9 +662,10 @@ class UniversalMonitor:
 
             elif miner['type_hint'] == "goldshell":
                 # Goldshell (Mini Doge 2/3, HS Box, etc.) — HTTP /api/v1/ REST API
-                info = requests.get(f"http://{ip}/api/v1/info", timeout=3.0).json()
-                sum_r = requests.get(f"http://{ip}/api/v1/cgminer?cgminer=summary", timeout=3.0).json()
-                pool_r = requests.get(f"http://{ip}/api/v1/cgminer?cgminer=pools", timeout=3.0).json()
+                sess = _make_session(ip, "goldshell")
+                info  = sess.get(f"http://{ip}/api/v1/info", timeout=3.0).json()
+                sum_r = sess.get(f"http://{ip}/api/v1/cgminer?cgminer=summary", timeout=3.0).json()
+                pool_r = sess.get(f"http://{ip}/api/v1/cgminer?cgminer=pools", timeout=3.0).json()
                 s = sum_r.get('SUMMARY', [{}])[0]
                 p = pool_r.get('POOLS', [{}])[0]
                 h_th = (s.get('GHS 5s') or s.get('MHS 5s', 0) / 1000) / 1000
@@ -643,7 +698,8 @@ class UniversalMonitor:
 
             else:
                 # NerdAxe / Bitaxe / Lucky / Gamma — HTTP /api/system/info
-                r = requests.get(f"http://{ip}/api/system/info", timeout=3.0).json()
+                sess = _make_session(ip, miner['type_hint'])
+                r = sess.get(f"http://{ip}/api/system/info", timeout=3.0).json()
                 st = r.get('stratum', {})
                 h_th = r.get('hashRate', 0) / 1000
                 dc = float(r.get('power', 0))
@@ -698,7 +754,7 @@ class UniversalMonitor:
         header_style = "bold bright_white"
 
         perf_t = Table(expand=True, border_style="dim")
-        perf_t.add_column("Miner", style="cyan", width=22, header_style=header_style)
+        perf_t.add_column("Miner", style="cyan", width=26, header_style=header_style)
         perf_t.add_column("Hashrate", justify="right", header_style=header_style)
         perf_t.add_column("Efficiency", justify="center", style="bold white", header_style=header_style)
         perf_t.add_column("Temp Asic/VR", justify="center", style="yellow", header_style=header_style)
@@ -707,7 +763,7 @@ class UniversalMonitor:
         perf_t.add_column("Fan", justify="right", style="bold cyan", header_style=header_style)
 
         luck_t = Table(expand=True, border_style="dim")
-        luck_t.add_column("Miner", style="cyan", width=12, header_style=header_style)
+        luck_t.add_column("Miner", style="cyan", width=26, header_style=header_style)
         luck_t.add_column("Uptime", justify="center", style="bold blue", header_style=header_style)
         luck_t.add_column("Best Diff All-time", justify="right", style="bold green", header_style=header_style)
         luck_t.add_column("Best Diff Session", justify="right", style="green", header_style=header_style)
@@ -724,26 +780,27 @@ class UniversalMonitor:
 
         for m in self.miners:
             st = self.miner_data.get(m['ip'], {"online": False})
+            miner_label = f"{m['name']}\n[dim]{m['ip']}[/]"
             if st.get("online"):
                 total_hash += st['hash']
                 online_count += 1
                 perf_t.add_row(
-                    f"{m['name']} [dim]({st['ver']})[/]",
+                    f"{m['name']} [dim]({st['ver']})[/]\n[dim]{m['ip']}[/]",
                     f"{st['hash']:.2f} TH/s", st['eff'], st['temp'],
                     st['pwr'], st['vf'], st['fan']
                 )
                 luck_t.add_row(
-                    m['name'], st['up'], st['bd'], st['sd'],
+                    miner_label, st['up'], st['bd'], st['sd'],
                     st['sh'], st['pd'], str(st['bl'])
                 )
                 pool_t.add_row(m['name'], m['ip'], st['p'], st['ping'], st['u'])
             elif st.get("loading"):
-                perf_t.add_row(m['name'], "[yellow]INIT...[/]", "-", "-", "-", "-", "-")
-                luck_t.add_row(m['name'], "-", "-", "-", "-", "-", "-")
+                perf_t.add_row(miner_label, "[yellow]INIT...[/]", "-", "-", "-", "-", "-")
+                luck_t.add_row(miner_label, "-", "-", "-", "-", "-", "-")
                 pool_t.add_row(m['name'], m['ip'], "-", "-", "-")
             else:
-                perf_t.add_row(m['name'], "[red]OFFLINE[/]", "-", "-", "-", "-", "-")
-                luck_t.add_row(m['name'], "-", "-", "-", "-", "-", "-")
+                perf_t.add_row(miner_label, "[red]OFFLINE[/]", "-", "-", "-", "-", "-")
+                luck_t.add_row(miner_label, "-", "-", "-", "-", "-", "-")
                 pool_t.add_row(m['name'], m['ip'], "[red]Disconnected[/]", "-", "-")
 
         header = Table.grid(expand=True)
