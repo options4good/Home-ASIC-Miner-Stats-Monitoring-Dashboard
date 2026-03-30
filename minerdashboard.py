@@ -103,13 +103,16 @@ def get_local_subnet():
         return None, None
 
 
-def _cgminer_cmd(ip, command, port=4028, timeout=1.5):
-    """Send a single command to the cgminer API and return parsed JSON or None."""
+def _cgminer_cmd(ip, command, parameter=None, port=4028, timeout=1.5):
+    """Send a command (with optional parameter) to the cgminer API. Returns parsed JSON or None."""
     try:
+        payload = {"command": command}
+        if parameter is not None:
+            payload["parameter"] = str(parameter)
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
             s.connect((ip, port))
-            s.sendall(json.dumps({"command": command}).encode())
+            s.sendall(json.dumps(payload).encode())
             buf = b""
             while True:
                 chunk = s.recv(8192)
@@ -124,7 +127,7 @@ def _cgminer_cmd(ip, command, port=4028, timeout=1.5):
 
 def probe_cgminer(ip, port=4028, timeout=1.5):
     """Probe cgminer API (Avalon, Antminer S9, etc). Returns summary dict or None."""
-    data = _cgminer_cmd(ip, "summary", port, timeout)
+    data = _cgminer_cmd(ip, "summary", port=port, timeout=timeout)
     if data and 'SUMMARY' in data:
         return {"api": "cgminer", "data": data}
     return None
@@ -148,49 +151,66 @@ def probe_http_api(ip, timeout=1.5):
 
 
 def detect_miner_type(ip, result):
-    """Try to identify the miner model from scan results."""
+    """Identify miner model from scan results. Never hardcode names — fetch from device."""
+    last = ip.split('.')[-1]
+
     if result["api"] == "cgminer":
-        # Query version command for better device identification
-        ver_data = _cgminer_cmd(ip, "version")
+        # Query version command — Avalon returns e.g. "Type": "Avalon Q" or "Avalon1246 aa-..."
         type_str = ""
+        ver_data = _cgminer_cmd(ip, "version", timeout=2.0)
         if ver_data:
             ver_info = ver_data.get("VERSION", [{}])[0]
-            type_str = ver_info.get("Type", ver_info.get("Description", ""))
+            # Prefer Type, then Miner (firmware string), then Description
+            type_str = (
+                ver_info.get("Type")
+                or ver_info.get("Description")
+                or ver_info.get("Miner")
+                or ""
+            ).strip()
         if not type_str:
-            # Fallback to summary Description
-            type_str = result["data"].get("SUMMARY", [{}])[0].get("Description", "")
+            # Fallback: Description in summary
+            type_str = result["data"].get("SUMMARY", [{}])[0].get("Description", "").strip()
+
         type_lower = type_str.lower()
-        last = ip.split('.')[-1]
-        if "avalon" in type_lower:
-            name = type_str.split()[0] if type_str else f"Avalon-{last}"
-            return "avalon", name
         if "antminer" in type_lower or "bmminer" in type_lower:
-            name = type_str.split()[0] if type_str else f"Antminer-{last}"
-            return "antminer", name
-        # Default: Avalon (most common cgminer device on port 4028)
-        return "avalon", f"Avalon-{last}"
+            return "antminer", type_str or f"Antminer-{last}"
+        if "avalon" in type_lower or type_str:
+            # Use whatever the device reported; fallback to IP hint
+            return "avalon", type_str or f"Avalon-{last}"
+        # Nothing came back from the API — use IP hint
+        return "avalon", f"Miner-{last}"
+
     elif result["api"] == "http":
         data = result["data"]
-        hostname = str(data.get("hostname", "")).lower()
-        board = str(data.get("boardVersion", data.get("board", ""))).lower()
-        model = str(data.get("model", data.get("deviceModel", ""))).lower()
-        version = str(data.get("version", "")).lower()
-        combined = f"{hostname} {board} {model} {version}"
+        # Pull the most descriptive name available from the device
+        device_name = (
+            data.get("hostname")
+            or data.get("model")
+            or data.get("deviceModel")
+            or data.get("boardVersion")
+            or ""
+        ).strip()
 
-        last = ip.split('.')[-1]
+        combined = " ".join([
+            str(data.get("hostname", "")),
+            str(data.get("boardVersion", data.get("board", ""))),
+            str(data.get("model", data.get("deviceModel", ""))),
+            str(data.get("version", "")),
+        ]).lower()
+
+        if "antminer" in combined:
+            return "antminer", device_name or f"Antminer-{last}"
+        if "lucky" in combined:
+            return "lucky", device_name or f"Lucky-{last}"
         if "nerd" in combined:
-            return "nerd", data.get("hostname") or f"NerdAxe-{last}"
-        elif "gamma" in combined:
-            return "nerd", data.get("hostname") or f"Gamma-{last}"
-        elif "lucky" in combined:
-            return "lucky", data.get("hostname") or f"Lucky-{last}"
-        elif "bitaxe" in combined:
-            return "nerd", data.get("hostname") or f"Bitaxe-{last}"
-        elif "antminer" in combined:
-            return "antminer", data.get("hostname") or f"Antminer-{last}"
-        else:
-            return "nerd", data.get("hostname") or f"Miner-{last}"
-    return "unknown", "Unknown"
+            return "nerd", device_name or f"NerdAxe-{last}"
+        if "gamma" in combined:
+            return "nerd", device_name or f"Gamma-{last}"
+        if "bitaxe" in combined:
+            return "nerd", device_name or f"Bitaxe-{last}"
+        return "nerd", device_name or f"Miner-{last}"
+
+    return "unknown", f"Miner-{last}"
 
 
 def scan_network(subnet=None, max_workers=100):
@@ -404,7 +424,7 @@ def _keyboard_reader() -> None:
         while True:
             if select.select([sys.stdin], [], [], 0.05)[0]:
                 ch = sys.stdin.read(1)
-                if ch in ('q', 'Q', 'a', 'A', 'r', 'R', 'd', 'D', 's', 'S', '\x03'):
+                if ch in ('q', 'Q', 'a', 'A', 'r', 'R', 'd', 'D', 's', 'S', 'f', 'F', 'c', 'C', '\x03'):
                     _cmd_queue.put(ch.lower())
     except Exception:
         pass
@@ -660,11 +680,14 @@ class UniversalMonitor:
 
         controls = (
             "[bold dim]── Controls ──[/]\n"
-            "[bold cyan][a][/] add miner\n"
-            "[bold cyan][r][/] rename\n"
-            "[bold cyan][d][/] delete\n"
-            "[bold cyan][s][/] rescan LAN\n"
-            "[bold cyan][q][/] quit"
+            "[bold cyan]a[/] add miner\n"
+            "[bold cyan]r[/] rename\n"
+            "[bold cyan]d[/] delete\n"
+            "[bold cyan]f[/] fan speed\n"
+            "[bold cyan]s[/] rescan LAN\n"
+            "[bold cyan]c[/] clear+rescan\n"
+            "[bold cyan]q[/] quit\n"
+            "[dim]Ctrl+C cancels[/]"
         )
 
         layout = Layout()
@@ -680,7 +703,7 @@ class UniversalMonitor:
         )
         layout["right"].split_column(
             Layout(Panel("\n".join(self.share_logs), title="[bold]Activity[/]", border_style="bold bright_yellow"), ratio=4),
-            Layout(Panel(controls, border_style="dim"), size=10),
+            Layout(Panel(controls, border_style="dim"), size=13),
         )
         return layout
 
@@ -788,55 +811,111 @@ Examples:
             break
 
         elif cmd == 'a':
-            console.print("\n[bold cyan]Add Miner[/]")
-            ip = Prompt.ask("  IP address")
-            last = ip.split('.')[-1]
-            name = Prompt.ask("  Name", default=f"Miner-{last}")
-            type_hint = Prompt.ask("  Type", choices=["avalon", "nerd", "lucky", "antminer"], default="avalon")
-            existing = load_config()
-            if not any(m['ip'] == ip for m in existing):
-                existing.append({"ip": ip, "name": name, "type_hint": type_hint})
-                save_config(existing)
-                console.print(f"[green]Added {name} ({ip})[/]")
-            else:
-                console.print(f"[yellow]{ip} already in config[/]")
+            console.print("\n[bold cyan]Add Miner[/]  [dim](Ctrl+C to cancel)[/]")
+            try:
+                ip = Prompt.ask("  IP address")
+                last = ip.split('.')[-1]
+                # Auto-detect type from device
+                console.print(f"  [dim]Probing {ip}...[/]", end="")
+                probe = probe_cgminer(ip) or probe_http_api(ip)
+                if probe:
+                    detected_type, detected_name = detect_miner_type(ip, probe)
+                    console.print(f" found: [green]{detected_name}[/]")
+                else:
+                    detected_type, detected_name = "avalon", f"Miner-{last}"
+                    console.print(" [yellow]no response, using defaults[/]")
+                name = Prompt.ask("  Name", default=detected_name)
+                type_hint = Prompt.ask("  Type", choices=["avalon", "nerd", "lucky", "antminer"], default=detected_type)
+                existing = load_config()
+                if not any(m['ip'] == ip for m in existing):
+                    existing.append({"ip": ip, "name": name, "type_hint": type_hint})
+                    save_config(existing)
+                    console.print(f"[green]Added {name} ({ip})[/]")
+                else:
+                    console.print(f"[yellow]{ip} already in config[/]")
+            except KeyboardInterrupt:
+                console.print("\n[dim]Cancelled.[/]")
             time.sleep(0.5)
             mon = UniversalMonitor(load_config())
 
         elif cmd == 'r':
-            console.print("\n[bold cyan]Rename Miner[/]")
-            target = Prompt.ask("  IP or current name")
+            console.print("\n[bold cyan]Rename Miner[/]  [dim](Ctrl+C to cancel)[/]")
             existing = load_config()
-            match = next((m for m in existing if m['ip'] == target or m['name'] == target), None)
-            if match:
-                new_name = Prompt.ask("  New name", default=match['name'])
-                match['name'] = new_name
-                save_config(existing)
-                console.print(f"[green]Renamed to {new_name}[/]")
-            else:
-                console.print(f"[yellow]Not found: {target}[/]")
+            console.print("  Miners: " + "  ".join(f"[cyan]{m['name']}[/] ({m['ip']})" for m in existing))
+            try:
+                target = Prompt.ask("  IP or current name")
+                match = next((m for m in existing if m['ip'] == target or m['name'] == target), None)
+                if match:
+                    new_name = Prompt.ask("  New name", default=match['name'])
+                    match['name'] = new_name
+                    save_config(existing)
+                    console.print(f"[green]Renamed → {new_name}[/]")
+                else:
+                    console.print(f"[yellow]Not found: {target}[/]")
+            except KeyboardInterrupt:
+                console.print("\n[dim]Cancelled.[/]")
             time.sleep(0.5)
             mon = UniversalMonitor(load_config())
 
         elif cmd == 'd':
-            console.print("\n[bold cyan]Delete Miner[/]")
-            target = Prompt.ask("  IP or name")
+            console.print("\n[bold cyan]Delete Miner[/]  [dim](Ctrl+C to cancel)[/]")
             existing = load_config()
-            before = len(existing)
-            existing = [m for m in existing if m['ip'] != target and m['name'] != target]
-            if len(existing) < before:
-                save_config(existing)
-                console.print(f"[green]Removed {target}[/]")
-                if not existing:
-                    console.print("[yellow]No miners left in config.[/]")
-                    break
-            else:
-                console.print(f"[yellow]Not found: {target}[/]")
+            console.print("  Miners: " + "  ".join(f"[cyan]{m['name']}[/] ({m['ip']})" for m in existing))
+            try:
+                target = Prompt.ask("  IP or name to delete")
+                before = len(existing)
+                existing = [m for m in existing if m['ip'] != target and m['name'] != target]
+                if len(existing) < before:
+                    save_config(existing)
+                    console.print(f"[green]Removed {target}[/]")
+                    if not existing:
+                        console.print("[yellow]No miners left.[/]")
+                        break
+                else:
+                    console.print(f"[yellow]Not found: {target}[/]")
+            except KeyboardInterrupt:
+                console.print("\n[dim]Cancelled.[/]")
             time.sleep(0.5)
             mon = UniversalMonitor(load_config())
 
+        elif cmd == 'f':
+            console.print("\n[bold cyan]Fan Speed Control[/]  [dim](Ctrl+C to cancel)[/]")
+            existing = load_config()
+            avalon_miners = [m for m in existing if m['type_hint'] == 'avalon']
+            if not avalon_miners:
+                console.print("[yellow]No Avalon/cgminer miners in config (fan control uses cgminer API)[/]")
+                time.sleep(1)
+                mon = UniversalMonitor(load_config())
+                continue
+            console.print("  Miners: " + "  ".join(f"[cyan]{m['name']}[/] ({m['ip']})" for m in avalon_miners))
+            try:
+                target = Prompt.ask("  IP or name (or 'all')")
+                speed = Prompt.ask("  Fan speed % (0-100)", default="60")
+                try:
+                    speed_val = max(0, min(100, int(speed)))
+                except ValueError:
+                    console.print("[red]Invalid value — must be 0-100[/]")
+                    time.sleep(1)
+                    mon = UniversalMonitor(load_config())
+                    continue
+                targets = avalon_miners if target.lower() == 'all' else [
+                    m for m in avalon_miners if m['ip'] == target or m['name'] == target
+                ]
+                if not targets:
+                    console.print(f"[yellow]Not found: {target}[/]")
+                else:
+                    for m in targets:
+                        r = _cgminer_cmd(m['ip'], "ascset", parameter=f"0,fan,{speed_val}", timeout=3.0)
+                        status = r.get("STATUS", [{}])[0].get("STATUS", "?") if r else "no response"
+                        icon = "[green]✓[/]" if status == "S" else "[yellow]~[/]"
+                        console.print(f"  {icon} {m['name']} ({m['ip']}) → fan {speed_val}%  ({status})")
+            except KeyboardInterrupt:
+                console.print("\n[dim]Cancelled.[/]")
+            time.sleep(1)
+            mon = UniversalMonitor(load_config())
+
         elif cmd == 's':
-            console.print("\n[bold cyan]Rescanning LAN...[/]")
+            console.print("\n[bold cyan]Rescanning LAN — adding new miners...[/]")
             subnet, _ = get_local_subnet()
             discovered = scan_network(subnet)
             if discovered:
@@ -852,6 +931,23 @@ Examples:
                 console.print(f"[green]{added} new miner(s) added.[/]" if added else "[dim]No new miners found.[/]")
             else:
                 console.print("[yellow]No miners found.[/]")
+            time.sleep(1)
+            mon = UniversalMonitor(load_config())
+
+        elif cmd == 'c':
+            console.print("\n[bold cyan]Clear config and rescan LAN...[/]")
+            subnet, local_ip = get_local_subnet()
+            if subnet:
+                console.print(f"[dim]Local IP: {local_ip}  |  Subnet: {subnet}[/]")
+            discovered = scan_network(subnet) if subnet else []
+            if discovered:
+                miners_new = [{"ip": d['ip'], "name": d['name'], "type_hint": d['type_hint']} for d in discovered]
+                save_config(miners_new)
+                for d in discovered:
+                    console.print(f"  [green]✓[/] {d['ip']}  {d['name']}")
+                console.print(f"[green]Config rebuilt with {len(miners_new)} miner(s).[/]")
+            else:
+                console.print("[yellow]No miners found — config unchanged.[/]")
             time.sleep(1)
             mon = UniversalMonitor(load_config())
 
