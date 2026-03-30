@@ -721,9 +721,9 @@ Examples:
   python3 minerdashboard.py                  # Run dashboard (setup wizard on first run)
   python3 minerdashboard.py --scan           # Scan LAN for miners
   python3 minerdashboard.py --scan --subnet 10.0.0.0/24
-  python3 minerdashboard.py --add 192.168.0.108 --name Avalon-Q --type avalon
-  python3 minerdashboard.py --rename 192.168.0.108 --new-name Avalon-Q
-  python3 minerdashboard.py --remove 192.168.0.108
+  python3 minerdashboard.py --add 192.168.1.10 --name Avalon-Q --type avalon
+  python3 minerdashboard.py --rename 192.168.1.10 --new-name Avalon-Q
+  python3 minerdashboard.py --remove 192.168.1.10
   python3 minerdashboard.py --list           # Show configured miners
   python3 minerdashboard.py --setup          # Re-run setup wizard
         """

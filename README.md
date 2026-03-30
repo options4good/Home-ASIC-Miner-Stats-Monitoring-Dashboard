@@ -27,9 +27,9 @@ First run launches an interactive setup wizard that auto-scans your LAN for mine
 ./run.sh --scan --subnet 10.0.0.0/24
 
 # Manage miners
-./run.sh --add 192.168.0.108 --name Avalon-Q --type avalon
-./run.sh --rename 192.168.0.108 --new-name Avalon-Q
-./run.sh --remove 192.168.0.108
+./run.sh --add 192.168.1.10 --name Avalon-Q --type avalon
+./run.sh --rename 192.168.1.10 --new-name Avalon-Q
+./run.sh --remove 192.168.1.10
 ./run.sh --list
 
 # Re-run setup wizard
@@ -52,8 +52,8 @@ Miners are stored in `miners.json` next to the script. Edit it directly or use t
 
 ```json
 [
-  {"ip": "192.168.0.108", "name": "Avalon-Q", "type_hint": "avalon"},
-  {"ip": "192.168.0.101", "name": "NerdAxe-1", "type_hint": "nerd"}
+  {"ip": "192.168.1.10", "name": "Avalon-Q", "type_hint": "avalon"},
+  {"ip": "192.168.1.11", "name": "NerdAxe-1", "type_hint": "nerd"}
 ]
 ```
 
