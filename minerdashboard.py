@@ -44,12 +44,17 @@ except ImportError:
     print("Install with: pip install requests")
     sys.exit(1)
 
-APP_VERSION = "V3.2.0"
+APP_VERSION = "V3.3.0"
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "miners.json")
 console = Console()
 
 # Cached authenticated HTTP sessions keyed by IP
 _sessions: dict = {}
+
+
+def _cap_name(s: str) -> str:
+    """Title-case a miner model name from device API (handles ALL-CAPS and lowercase)."""
+    return s.strip().title() if s else s
 
 
 # =============================================================================
@@ -140,11 +145,11 @@ def probe_http_api(ip, timeout=1.5):
     """Probe HTTP API miners. Tries Goldshell, NerdAxe/Bitaxe, Lucky, Gamma endpoints."""
     checks = [
         # (port, path, required_keys)
-        (80,   "/api/v1/info",      ["model", "fwVersion"]),           # Goldshell
+        (80,   "/mcb/status",       ["model", "firmware"]),             # Goldshell (/mcb/ API)
         (80,   "/api/system/info",  ["hashRate", "hostname"]),          # NerdAxe/Bitaxe
         (8080, "/api/system/info",  ["hashRate", "hostname"]),
         (80,   "/api/system",       ["hashRate", "hostname"]),
-        (80,   "/api/v1/status",    ["model"]),                         # some Goldshell variants
+        (80,   "/api/v1/status",    ["model"]),                         # some variants
     ]
     for port, path, keys in checks:
         try:
@@ -180,25 +185,25 @@ def detect_miner_type(ip, result):
 
         # Goldshell uses "intminer" as their internal cgminer fork name
         if "intminer" in cgminer_impl:
-            # Cross-probe HTTP API for real model name (e.g. "HS BOX", "Mini DOGE Pro")
+            # Cross-probe /mcb/status HTTP API for real model name (e.g. "HS-BOX", "Mini-DOGE")
             http = probe_http_api(ip)
-            if http and "fwVersion" in http["data"] and "model" in http["data"]:
+            if http and "firmware" in http["data"] and "model" in http["data"]:
                 model = http["data"].get("model", "").strip()
-                return "goldshell", model or f"Goldshell-{last}"
+                return "goldshell", _cap_name(model) or f"Goldshell-{last}"
             return "goldshell", f"Goldshell-{last}"
 
         if "antminer" in type_lower or "bmminer" in type_lower:
-            return "antminer", type_str if type_str else f"Antminer-{last}"
+            return "antminer", _cap_name(type_str) if type_str else f"Antminer-{last}"
 
         if "avalon" in type_lower:
             # Strip trailing firmware date stamps (e.g. "Avalon1246 aa-20220928" → "Avalon1246")
             name = re.sub(r'\s+[a-z]{2}-\d{8}.*', '', type_str).strip()
-            return "avalon", name or f"Avalon-{last}"
+            return "avalon", _cap_name(name) or f"Avalon-{last}"
 
         # type_str exists but isn't a recognised brand — only use it if it looks like a model name
         # (reject strings with version numbers or "unknown")
         if type_str and "unknown" not in type_lower and not re.search(r'\d+\.\d+', type_str):
-            return "avalon", type_str
+            return "avalon", _cap_name(type_str)
 
         return "avalon", f"Miner-{last}"
 
@@ -206,10 +211,10 @@ def detect_miner_type(ip, result):
         data = result["data"]
         path = result.get("path", "")
 
-        # Goldshell: identified by fwVersion + model keys (their /api/v1/ endpoints)
-        if "fwVersion" in data and "model" in data:
+        # Goldshell: /mcb/status returns {"model": "HS-BOX", "firmware": "2.1.8", "hardware": "2.0"}
+        if "firmware" in data and "model" in data:
             model = str(data.get("model", "")).strip()
-            return "goldshell", model or f"Goldshell-{last}"
+            return "goldshell", _cap_name(model) or f"Goldshell-{last}"
 
         # Pull best available name for other HTTP devices
         device_name = (
@@ -228,16 +233,16 @@ def detect_miner_type(ip, result):
         ]).lower()
 
         if "antminer" in combined:
-            return "antminer", device_name or f"Antminer-{last}"
+            return "antminer", _cap_name(device_name) or f"Antminer-{last}"
         if "lucky" in combined:
-            return "lucky", device_name or f"Lucky-{last}"
+            return "lucky", _cap_name(device_name) or f"Lucky-{last}"
         if "gamma" in combined:
-            return "nerd", device_name or f"Gamma-{last}"
+            return "nerd", _cap_name(device_name) or f"Gamma-{last}"
         if "bitaxe" in combined:
-            return "nerd", device_name or f"Bitaxe-{last}"
+            return "nerd", _cap_name(device_name) or f"Bitaxe-{last}"
         if "nerd" in combined:
-            return "nerd", device_name or f"NerdAxe-{last}"
-        return "nerd", device_name or f"Miner-{last}"
+            return "nerd", _cap_name(device_name) or f"NerdAxe-{last}"
+        return "nerd", _cap_name(device_name) or f"Miner-{last}"
 
     return "unknown", f"Miner-{last}"
 
@@ -439,43 +444,38 @@ def cmd_setup(args):
 # HTTP Session Manager (auto-auth)
 # =============================================================================
 
-# Credentials tried in order for each device type
+# Default credentials per miner type (tried in order for HTTP Basic Auth)
+# Goldshell /mcb/ API is open — no auth needed.
+# Bitaxe/NerdAxe are open — no auth needed.
 _CREDS = {
-    "goldshell": [("admin", "123456789"), ("admin", "admin")],
-    "default":   [("root", "root"), ("admin", "admin"), ("admin", "123456789")],
+    "antminer": [("root", "root"), ("root", "admin"), ("admin", "admin")],
+    "nerd":     [],  # no auth
+    "goldshell": [], # /mcb/ API is public, no auth required
+    "lucky":    [("admin", "admin"), ("root", "root")],
+    "default":  [("root", "root"), ("admin", "admin"), ("root", "admin"),
+                 ("admin", "123456789"), ("futurebit", "futurebit123")],
+}
+
+# Probe paths used to test credentials for each type
+_AUTH_PROBE = {
+    "antminer": "/api/v3/summary",
+    "default":  "/api/system/info",
 }
 
 
 def _make_session(ip: str, type_hint: str) -> requests.Session:
-    """Return a cached, authenticated requests.Session for an HTTP miner.
-
-    Goldshell: POSTs to /api/v1/user/login and stores the JWT bearer token.
-    Others: falls back to HTTP Basic Auth.
-    """
+    """Return a cached requests.Session, with HTTP Basic Auth set if the device requires it."""
     if ip in _sessions:
         return _sessions[ip]
 
     s = requests.Session()
     creds = _CREDS.get(type_hint, _CREDS["default"])
 
-    if type_hint == "goldshell":
+    if creds:
+        probe = _AUTH_PROBE.get(type_hint, _AUTH_PROBE["default"])
         for user, pwd in creds:
             try:
-                r = s.post(f"http://{ip}/api/v1/user/login",
-                           json={"username": user, "password": pwd}, timeout=3.0)
-                if r.status_code == 200:
-                    token = r.json().get("token") or r.json().get("jwt", "")
-                    if token:
-                        s.headers["Authorization"] = f"Bearer {token}"
-                    break   # login accepted (even if no token — cookie may be set)
-            except Exception:
-                pass
-    else:
-        # Try Basic Auth — use first pair that returns 200 on a quick probe
-        for user, pwd in creds:
-            try:
-                r = requests.get(f"http://{ip}/api/system/info",
-                                 auth=(user, pwd), timeout=2.0)
+                r = requests.get(f"http://{ip}{probe}", auth=(user, pwd), timeout=2.0)
                 if r.status_code == 200:
                     s.auth = (user, pwd)
                     break
@@ -661,39 +661,59 @@ class UniversalMonitor:
                     }
 
             elif miner['type_hint'] == "goldshell":
-                # Goldshell (Mini Doge 2/3, HS Box, etc.) — HTTP /api/v1/ REST API
-                sess = _make_session(ip, "goldshell")
-                info  = sess.get(f"http://{ip}/api/v1/info", timeout=3.0).json()
-                sum_r = sess.get(f"http://{ip}/api/v1/cgminer?cgminer=summary", timeout=3.0).json()
-                pool_r = sess.get(f"http://{ip}/api/v1/cgminer?cgminer=pools", timeout=3.0).json()
-                s = sum_r.get('SUMMARY', [{}])[0]
-                p = pool_r.get('POOLS', [{}])[0]
-                h_th = (s.get('GHS 5s') or s.get('MHS 5s', 0) / 1000) / 1000
-                acc = int(s.get('Accepted', 0))
-                rej = int(s.get('Rejected', 0))
-                blocks = int(s.get('Found Blocks', 0))
-                self._update_activity_logs(miner['name'], ip, acc, rej, blocks, now_ts)
-                fans_raw = info.get('fans', [])
-                fan_str = " / ".join(str(f.get('rpm', '--')) for f in fans_raw) + " RPM" if fans_raw else "--"
-                temps_raw = info.get('temps', [])
-                temp_str = " / ".join(str(t.get('temp', '--')) for t in temps_raw) + "°C" if temps_raw else f"{s.get('Temperature', 0)}°C"
+                # Goldshell (Mini Doge 2/3, HS Box, etc.) — /mcb/ HTTP API, no auth
+                base = f"http://{ip}"
+                status  = requests.get(f"{base}/mcb/status", timeout=3.0).json()
+                devs_r  = requests.get(f"{base}/mcb/cgminer?cgminercmd=devs", timeout=3.0).json()
+                pools_r = requests.get(f"{base}/mcb/cgminer?cgminercmd=pools", timeout=3.0).json()
+
+                # Response data is wrapped in a "data" key
+                d = devs_r.get("data") or {}
+                if isinstance(d, list):
+                    d = d[0] if d else {}
+                p = pools_r.get("data") or {}
+                if isinstance(p, list):
+                    p = p[0] if p else {}
+
+                # av_hashrate is in MH/s (e.g. 185 for Mini Doge scrypt, ~1850000 for HS Box SIA)
+                h_raw = float(d.get("av_hashrate") or d.get("hashrate") or 0)
+                if h_raw > 10000:
+                    # Very large MH/s value (e.g. SIA/Blake) — convert to TH/s for display
+                    h_display = h_raw / 1_000_000
+                    hash_unit = "TH/s"
+                else:
+                    h_display = h_raw
+                    hash_unit = "MH/s"
+
+                temp_raw = str(d.get("temp", "0")).replace("°C", "").replace(" ", "").split("/")[0]
+                try:
+                    temp_val = float(temp_raw)
+                except Exception:
+                    temp_val = 0
+
+                acc = int(d.get("accepted", 0))
+                rej = int(d.get("rejected", 0))
+                elapsed = int(d.get("time", 0))
+                self._update_activity_logs(miner['name'], ip, acc, rej, 0, now_ts)
+
                 return {
-                    "online": True, "hash": h_th,
-                    "ver": info.get('fwVersion', 'N/A'),
+                    "online": True,
+                    "hash": h_display,
+                    "hash_unit": hash_unit,
+                    "ver": status.get("firmware", "N/A"),
                     "eff": "--",
-                    "temp": temp_str,
-                    "pwr": f"{info.get('power', '--')}W" if info.get('power') else "--",
+                    "temp": f"{temp_val:.1f}°C",
+                    "pwr": "--",
                     "vf": "--",
-                    "fan": fan_str,
-                    "up": self._format_uptime(s.get('Elapsed', 0)),
-                    "bd": self._format_diff(s.get('Best Share', 0)),
-                    "sd": "--",
+                    "fan": str(d.get("fanspeed", "--")),
+                    "up": self._format_uptime(elapsed),
+                    "bd": "--", "sd": "--",
                     "sh": f"{acc}/{rej}",
-                    "pd": f"{int(float(p.get('Diff', 0))):,}" if p.get('Diff') else "--",
-                    "bl": blocks,
-                    "p": p.get('URL', 'Unknown'),
+                    "pd": "--",
+                    "bl": 0,
+                    "p": p.get("url") or p.get("URL", "Unknown"),
                     "ping": "--",
-                    "u": p.get('User', 'N/A')
+                    "u": p.get("user") or p.get("User", "N/A"),
                 }
 
             else:
@@ -782,11 +802,12 @@ class UniversalMonitor:
             st = self.miner_data.get(m['ip'], {"online": False})
             miner_label = f"{m['name']}\n[dim]{m['ip']}[/]"
             if st.get("online"):
-                total_hash += st['hash']
+                if st.get("hash_unit", "TH/s") == "TH/s":
+                    total_hash += st['hash']
                 online_count += 1
                 perf_t.add_row(
                     f"{m['name']} [dim]({st['ver']})[/]\n[dim]{m['ip']}[/]",
-                    f"{st['hash']:.2f} TH/s", st['eff'], st['temp'],
+                    f"{st['hash']:.2f} {st.get('hash_unit', 'TH/s')}", st['eff'], st['temp'],
                     st['pwr'], st['vf'], st['fan']
                 )
                 luck_t.add_row(
@@ -919,6 +940,24 @@ Examples:
         if not miners:
             console.print("[red]No miners found. Add one: ./run.sh --add IP --name NAME[/]")
             sys.exit(1)
+    else:
+        # Re-probe any miner that still has a generic Miner-N fallback name
+        # (happens when first scan couldn't identify the device — e.g. Goldshell before fix)
+        updated = False
+        for m in miners:
+            if re.fullmatch(r'Miner-\d+', m.get('name', '')):
+                console.print(f"[dim]Re-probing {m['ip']} (unknown type)...[/]")
+                result = probe_cgminer(m['ip'])
+                if not result:
+                    result = probe_http_api(m['ip'])
+                if result:
+                    t, name = detect_miner_type(m['ip'], result)
+                    m['type_hint'] = t
+                    m['name'] = name
+                    updated = True
+                    console.print(f"  [green]→ {name} ({t})[/]")
+        if updated:
+            save_config(miners)
 
     console.print(f"[cyan]Starting dashboard with {len(miners)} miner(s)...[/]")
     time.sleep(0.5)
