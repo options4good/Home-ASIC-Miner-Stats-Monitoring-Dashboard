@@ -1,0 +1,6 @@
+version: "1"
+rules:
+  - base: master
+    upstream: options4good:master
+    mergeMethod: merge
+    mergeUnstable: false
