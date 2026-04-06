@@ -1,7 +1,7 @@
 <h1>Home ASIC Miner Stats Monitoring Dashboard</h1>
 Home ASIC Miner Stats Monitoring Dashboard Application for: Bitaxe, NerdQaxe, Lucky Miner, Avalon Q, Avalon Nano &amp; More. A perfect way to view stats for all of your home miners in one place. I hope I can contribute with this small project to the community and many of you will enjoy my creation. The dashboard application supports and can receive and display data from Bitaxe, NerdQaxe, Lucky Miner and Avalon home miners.<br><br>
 
-<img width="2121" height="1019" alt="minerdashboardv222" src="https://github.com/user-attachments/assets/450ee28c-1a03-4d67-9f15-0c8aeeb9e237" />
+<img width="848" height="482" alt="minerdashboardv248" src="https://github.com/user-attachments/assets/7bfb8f5c-1cf8-4668-b05a-d961233dc365" />
 
 <h2>What are the current features?</h2>
 
